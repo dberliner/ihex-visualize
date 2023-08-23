@@ -15,7 +15,8 @@ ihex-visualize --help
 
 ## Limitations
 
-* The parsing supports Extended Segment Address directives but not Extended Linear Address. Start Segment Address and Start Linear Address have no effect on analysis.
-* A data line wrapping around the end of a segment block is not supported at this time.
+* Start Segment Address and Start Linear Address have no effect on analysis.
 * Any invalid line will be ignored (IE a line with a bad checksum)
 * Segments must align to a full character - a single character cannot represent two segments.
+* EOF records are not currently supported. Visual blocks are treated as existing to the end of the last segment with data records.
+* All output assumes a monospace font
