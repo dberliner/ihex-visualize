@@ -14,11 +14,11 @@ struct Args {
     file: Option<String>,
 
     /// Number of bytes per character. Currently supported are values are 2^n for n∈[3,11] (so 8, 16 ... 2048)
-    #[arg(short, long, default_value_t = 8)]
+    #[arg(short, long, default_value_t = 64)]
     density_bytes: u16,
 
     /// Number of characters per line
-    #[arg(short, long, default_value_t = 32)]
+    #[arg(short, long, default_value_t = 128)]
     width_symbols: u16,
 
     // Print the first (zero-th) page instead of the map
@@ -36,11 +36,9 @@ fn ibyte_to_mapbyte(ibyte: u16) -> usize {
 }
 
 fn fill_bytes(map: &mut Vec<u8>, start: u16, len: u16) {
-    /* Rusts amazing type system at work */
-    let end_addr =  (start as u32) + (len as u32);
-    if map.capacity() < (end_addr as f32 / 8.0_f32).ceil() as usize {
-        return;
-    }
+    /* Writes across a 64kb boundary wrap to the beginning of the same segment */
+    let remainder = ((start as i32) + (len as i32) - 0x10000).max(0) as u16;
+    let len = len - remainder;
 
     let bits_leading = {
         /* If start is alligned there are no leading bits */
@@ -70,6 +68,11 @@ fn fill_bytes(map: &mut Vec<u8>, start: u16, len: u16) {
         map[target_byte + (bytes_full as usize)]  |= !((1<<(8 - bits_ending))-1);
     }
 
+    /* Wrap around and fill any remaining bytes at the beginning */
+    if remainder > 0 {
+        fill_bytes(map, 0, remainder);
+    }
+
 }
 
 
@@ -77,12 +80,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
     let chr_blank = "░";
     let chr_data  = "▓";
-    let chr_undef = " ";
     let file_str = fs::read_to_string(args.file.expect("Memory error for args.file"))?;
-    let mut ihex_exs_addr: u16 = 0;
+    let mut ihex_ela_addr: u16 = 0;
+    let mut ihex_esx_addr: u16 = 0;
     let reader = Reader::new(&file_str);
     let segment_width_bytes: u16 = 8192;
-    /* Each segment will be a 2kb vector of bytes -- each bit representing a byte. Only populate a segment when we find an extended linear address indicating so */
+
     let mut segment_map: HashMap<u16, Vec<u8>> = HashMap::new();
     let log_level = if args.debug {log::Level::Debug} else {log::Level::Warn};
 
@@ -92,24 +95,34 @@ fn main() -> Result<(), Box<dyn Error>> {
        match line {
         Ok(v) => match v {
             Record::Data { offset, value } => {
+                let page = if ihex_esx_addr != 0 {
+                    (ihex_esx_addr & 0xF000)>>12 as u16
+                } else {
+                    ihex_ela_addr
+                };
+                let page_offset = if ihex_esx_addr != 0 {
+                    offset + (ihex_ela_addr & 0xFFF)
+                } else {
+                    offset
+                };
+                /* Starting address in page */
                 debug!(
-                    "I see a data row for page {ihex_exs_addr}+{offset} with a computed starting addr of {} and len of {}",
-                    (ihex_exs_addr as u32 * 0x10000) + offset as u32,
+                    "I see a data row for page {page}+{offset} with a computed starting addr of {page_offset} and len of {}",
                     value.len());
 
                 /* Find the segment or create it if it doesn't exist. */
-                segment_map.entry(ihex_exs_addr)
+                segment_map.entry(page)
                     .or_default()
                     .resize(segment_width_bytes as usize, 0);
 
                 /* Fill the proper bits in this segment */
                 fill_bytes(
-                    segment_map.get_mut(&ihex_exs_addr).expect("Could not find EXS"),
+                    segment_map.get_mut(&page).expect("Could not find EXS"),
                     offset,
                     value.len() as u16);
             },
-            Record::ExtendedSegmentAddress(addr) => ihex_exs_addr = addr,
-            Record::ExtendedLinearAddress(_) => return Err("Extended Linear Address not supported".into()),
+            Record::ExtendedSegmentAddress(addr) => { ihex_esx_addr = addr; ihex_ela_addr = 0; },
+            Record::ExtendedLinearAddress(addr)  => { ihex_esx_addr = 0; ihex_ela_addr = addr; },
             _ => {}, /* Other types not useful for this analysis */
         }
         Err(_) => {},
@@ -123,7 +136,6 @@ fn main() -> Result<(), Box<dyn Error>> {
             .cloned()
             .collect();
         seg_idxs.sort();
-
         
         /* Line wraps don't have to align to segment boundaries so keep an independent tracker */
         let mut print_cnt = 0;
