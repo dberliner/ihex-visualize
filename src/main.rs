@@ -41,10 +41,11 @@ fn fill_bytes(map: &mut Vec<u8>, start: u16, len: u16) {
     let len = len - remainder;
 
     let bits_leading = {
+        let len_or_8 = len.min(8);
         /* If start is alligned there are no leading bits */
-        if start % 8 == 0 {0}
+        if start % len_or_8 == 0 {0}
         /* Otherwise there are between 1 and 7 */
-        else {8 - (start % 8)}
+        else {len_or_8 - (start % 8)}
     };
     let bits_ending = (len - bits_leading) % 8;
     let bytes_full = (len - bits_leading - bits_ending) / 8;
