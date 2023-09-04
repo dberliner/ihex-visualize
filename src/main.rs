@@ -1,10 +1,17 @@
 use ihex::{Record,Reader};
+use log::{debug, warn};
 use std::collections::HashMap;
 use std::fs;
 use std::error::Error;
 use clap::Parser;
-use log::{info, debug, error};
-use simple_logger::SimpleLogger;
+use clap_num::maybe_hex;
+use crossterm::{cursor, queue, style, execute, terminal,};
+use std::io::{stdin, stdout, Read, Write};
+mod ihex_storage_utils;
+pub use crate::ihex_storage_utils::{*};
+
+const CHR_BLANK: char = '░';
+const CHR_DATA: char  = '▓';
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -13,150 +20,200 @@ struct Args {
     #[arg(short, long)]
     file: Option<String>,
 
-    /// Number of bytes per character. Currently supported are values are 2^n for n∈[3,11] (so 8, 16 ... 2048)
-    #[arg(short, long, default_value_t = 8)]
-    density_bytes: u16,
+    /// How many bytes each line represents (base 10 or hex)
+    #[arg(short, long, value_parser=maybe_hex::<u16>, default_value_t = 0x1000)]
+    line_width: u16,
 
-    /// Number of characters per line
-    #[arg(short, long, default_value_t = 32)]
-    width_symbols: u16,
-
-    // Print the first (zero-th) page instead of the map
-    #[arg(long, default_value_t = false)]
-    print_vector: bool,
+    /// How many characters should be generated per line (base 10 or hex)
+    #[arg(short, long, value_parser=maybe_hex::<u16>, default_value_t = 128)]
+    display_width: u16,
 
     // Enable debug output
     #[arg(long, default_value_t = false)]
     debug: bool,
-
 }
 
-fn ibyte_to_mapbyte(ibyte: u16) -> usize {
-    (ibyte / 8) as usize
+fn print_map_line(line: &Vec<bool>) {
+    let mut line_str = String::with_capacity(line.len());
+    for i in  line.into_iter() {line_str.push(if *i==false {CHR_BLANK} else {CHR_DATA})};
+
+    queue!(
+        stdout(),
+        /* Move past the last column */
+        cursor::MoveToColumn(10),
+        style::Print(format!("{line_str}")),
+        cursor::MoveToNextLine(1),
+    ).expect("Couldnt output line");
 }
 
-fn fill_bytes(map: &mut Vec<u8>, start: u16, len: u16) {
-    /* Rusts amazing type system at work */
-    let end_addr =  (start as u32) + (len as u32);
-    if map.capacity() < (end_addr as f32 / 8.0_f32).ceil() as usize {
-        return;
+fn fill_map_addrs(start_xy: (u16, u16), lines: u32, bracket_width: u8, hex_width: u8, line_size: u16, initial_offset: u16) {
+    let mut stdout = stdout();
+    queue!(stdout, cursor::SavePosition).expect("Couldnt save cursor");
+    for i in 0..lines {
+        let addr = i * line_size as u32 + (if i==0 {initial_offset as u32} else {0});
+        queue!(
+            stdout,
+            cursor::MoveTo(start_xy.0, start_xy.1 + i as u16),
+            /* Print a hex value of the desired length for the address */
+            style::Print(format!(
+                "{:<bracket_width$}",
+                format!(
+                    "{:#0hex_width$x}",
+                    addr,
+                    hex_width=hex_width as usize),
+                bracket_width=bracket_width as usize
+            )),
+        ).expect("Couldnt output line");
     }
-
-    let bits_leading = {
-        /* If start is alligned there are no leading bits */
-        if start % 8 == 0 {0}
-        /* Otherwise there are between 1 and 7 */
-        else {8 - (start % 8)}
-    };
-    let bits_ending = (len - bits_leading) % 8;
-    let bytes_full = (len - bits_leading - bits_ending) / 8;
-    debug!("This row is {bytes_full} bytes with leading={bits_leading} and tailing={bits_ending}");
-
-    /* Fill bits up to the byte boundary */
-    let mut target_byte = ibyte_to_mapbyte(start);
-    if bits_leading != 0 {
-        map[target_byte] |= (1<<bits_leading)-1;
-        target_byte += 1;
-    }
-
-    /* Fill the full bytes */
-    /* Note: Data records do cross segments but instead wrap around if offset + len > segment. TODO: Support this edge case */
-    for i in 0..bytes_full {
-        map[target_byte + (i as usize)] = 0xFF;
-    }
-
-    /* Fill any tailing bits */
-    if bits_ending != 0 {
-        map[target_byte + (bytes_full as usize)]  |= !((1<<(8 - bits_ending))-1);
-    }
-
+    queue!(stdout, cursor::RestorePosition).expect("Couldnt reset cursor");
 }
 
+fn pause() {
+    let mut stdout = stdout();
+    queue!(
+        stdout,
+        style::Print("Press Enter to exit"),
+        cursor::MoveToNextLine(2)
+    ).expect("Could not output");
+    stdout.flush().unwrap();
+    stdin().read(&mut [0]).unwrap();
+}
 
 fn main() -> Result<(), Box<dyn Error>> {
+    /* Get the hex file object */
     let args = Args::parse();
-    let chr_blank = "░";
-    let chr_data  = "▓";
-    let chr_undef = " ";
-    let file_str = fs::read_to_string(args.file.expect("Memory error for args.file"))?;
-    let mut ihex_exs_addr: u16 = 0;
-    let reader = Reader::new(&file_str);
-    let segment_width_bytes: u16 = 8192;
-    /* Each segment will be a 2kb vector of bytes -- each bit representing a byte. Only populate a segment when we find an extended linear address indicating so */
-    let mut segment_map: HashMap<u16, Vec<u8>> = HashMap::new();
-    let log_level = if args.debug {log::Level::Debug} else {log::Level::Warn};
+    let is_debug = args.debug;
+    let width_symbols = args.display_width;
+    let bytes_per_line = args.line_width ;
+    let bytes_per_char = bytes_per_line / width_symbols;
+    let bytes_per_char_rem = args.line_width % width_symbols;
+    let map_start_xy: (u16, u16) = (0, 2);
 
+    /* Init logging */
+    let log_level = if is_debug {log::Level::Debug} else {log::Level::Warn};
     simple_logger::init_with_level(log_level).unwrap();
 
-    for line in reader.into_iter() {
+    if bytes_per_char_rem > 0 {
+        warn!("The requested line width of {bytes_per_line} cannot be divided evenly across {width_symbols} \
+               characters. All characters will represent {bytes_per_char} characters except the last symbol \
+               of each line, which will represent {bytes_per_char_rem}.");
+    }
+
+    // TODO Support multiple segments per line
+    if IHEX_SEGMENT_BYTES % bytes_per_line as u32 != 0 {
+        warn!("Segments of {IHEX_SEGMENT_BYTES} cannot be evenly represented in {bytes_per_line} byte lines. Insufficient lines will be 0-filled.")
+    }
+
+    /* A counter must be kept between rows to indicate address offsets. Only one of these will ever be set at a time.gitf */
+    let mut ihex_ela_addr: u16 = 0;
+    let mut ihex_esx_addr: u16 = 0;
+
+    /* Store a map of every byte in the hex file, 0 if unset and 1 if set
+       8kb (mapping 64kb) segments are added on-demand to minimize memory usage */
+    let mut segment_map: HashMap<u16, Vec<u8>> = HashMap::new();
+
+    /* Get the hex file contents as a (ihex) Reader object */
+    let file_path = args.file.expect("Could not get file arg");
+    let file_contents = fs::read_to_string(file_path).expect("Could not read file");
+    let ihex_obj = Reader::new(&file_contents).into_iter();
+
+    for line in ihex_obj {
        match line {
         Ok(v) => match v {
             Record::Data { offset, value } => {
-                debug!(
-                    "I see a data row for page {ihex_exs_addr}+{offset} with a computed starting addr of {} and len of {}",
-                    (ihex_exs_addr as u32 * 0x10000) + offset as u32,
-                    value.len());
+                /* Determine wich part of the segment map we need to access. ESX can offset in or between pages. */
+                let (page, esx_offset) = if ihex_esx_addr != 0 {
+                    ((ihex_esx_addr & 0xF000)>>12 as u16, ihex_esx_addr*16)
+                } else {
+                    (ihex_ela_addr, 0)
+                };
 
                 /* Find the segment or create it if it doesn't exist. */
-                segment_map.entry(ihex_exs_addr)
+                segment_map.entry(page)
                     .or_default()
-                    .resize(segment_width_bytes as usize, 0);
+                    .resize(SEGMENT_BYTES as usize, 0);
 
                 /* Fill the proper bits in this segment */
                 fill_bytes(
-                    segment_map.get_mut(&ihex_exs_addr).expect("Could not find EXS"),
-                    offset,
+                    segment_map.get_mut(&page).expect("Could not find EXS"),
+                    offset + esx_offset,
                     value.len() as u16);
             },
-            Record::ExtendedSegmentAddress(addr) => ihex_exs_addr = addr,
-            Record::ExtendedLinearAddress(_) => return Err("Extended Linear Address not supported".into()),
+            Record::ExtendedSegmentAddress(addr) => { ihex_esx_addr = addr; ihex_ela_addr = 0; },
+            Record::ExtendedLinearAddress(addr)  => { ihex_esx_addr = 0; ihex_ela_addr = addr; },
             _ => {}, /* Other types not useful for this analysis */
         }
         Err(_) => {},
        }
     }
 
-    if args.print_vector == false {
-        /* Process the keys in order */
-        let mut seg_idxs: Vec<u16> = segment_map
-            .keys()
-            .cloned()
-            .collect();
-        seg_idxs.sort();
+    /* Process the keys in order */
+    let mut seg_idxs: Vec<u16> = segment_map
+        .keys()
+        .cloned()
+        .collect();
+    seg_idxs.sort();
 
-        
-        /* Line wraps don't have to align to segment boundaries so keep an independent tracker */
-        let mut print_cnt = 0;
-        /* The segment vector stores one byte per bit, so whatever the client is asked for should be divided by 8 */
-        let seg_vec_density = args.density_bytes / 8 as u16;
-        for seg_addr in 0..*seg_idxs.last().expect("Could not get last segment")+1 {
-            match segment_map.get(&seg_addr) {
-                Some(segment) => {
-                    for chr in 0..(segment_width_bytes/seg_vec_density) {
-                        let mut acc = false;
-                        for i in 0..seg_vec_density {
-                            if segment[(chr*seg_vec_density + i) as usize] != 0 {
-                                acc = true;
-                                break;
-                            }
+    /* The segment vector stores one byte per bit, so whatever the client is asked for should be divided by 8 */
+    let last_seg_idx = *seg_idxs.last().expect("Could not get last segment");
+
+    /* Fill in the address data */
+    let max_addr: u32 = (last_seg_idx as u32 + 1) * (SEGMENT_BYTES as u32) * 8 - 1;
+    let hex_width = (std::format!("{:#01x}", max_addr as u32).len() & 0xFF) as u8;
+    let lines_per_seg = IHEX_SEGMENT_BYTES / bytes_per_line as u32;
+    let lines_total = (max_addr + 1) / bytes_per_line as u32;
+
+    /* Write the data onto an alternatie screen */
+    execute!(stdout(), terminal::EnterAlternateScreen)?;
+    queue!(
+        stdout(),
+        cursor::MoveTo(0, 0),
+        style::Print(format!("Printing out segment map with bytes_per_line={bytes_per_line} bytes_per_char={bytes_per_char} hex_width={hex_width} lines_per_seg={lines_per_seg} lines_total={lines_total}")),
+        cursor::MoveToNextLine(2)
+    )?;
+    stdout().flush().expect("Could not flush");
+
+    // Fill in the addresses on the left
+    fill_map_addrs(map_start_xy, lines_total, 10, hex_width, bytes_per_line, 0);
+
+    /* Print the actual map */
+    for seg_idx in 0..last_seg_idx+1 {
+        match segment_map.get(&seg_idx) {
+            Some(segment) => {
+                for line_num in 0..lines_per_seg {
+                    let mut line_data: Vec<bool> = Vec::new();
+    
+                    for chr in 0..width_symbols {
+                        // The requested number of bytes plus the remainder at the end if asked for a nondivisible combination
+                        let is_last = chr==width_symbols-1;
+                        let num_bytes = bytes_per_char+{if is_last {bytes_per_char_rem} else {0}};
+                        // The offset in the segment
+                        let ihex_start_byte = bytes_per_line * line_num as u16 + chr * bytes_per_char;
+                        let res = is_seg_range_set(
+                            &segment,
+                            ihex_start_byte,
+                            num_bytes
+                        );
+                        line_data.push(res);
+                        if res {
+                            //println!("is_last={is_last} num_bytes={num_bytes} ihex_start_byte={ihex_start_byte} res={res}");
                         }
-                        print_cnt = print_cnt + 1;
-                        if acc {print!("{chr_data}");} else {print!("{chr_blank}");}
-                        if print_cnt % args.width_symbols == 0 {println!("|"); print_cnt = 0;}
                     }
-                },
-                None => {
-                    for _ in 0..(segment_width_bytes/seg_vec_density) {
-                        print_cnt = print_cnt + 1;
-                        print!("{chr_undef}");
-                        if print_cnt % args.width_symbols == 0 {println!("|"); print_cnt = 0;}
-                    }
-                },
-            };
-        }
-        println!("|");
-    } else {
-        println!("{:?}", segment_map[&0]);
+    
+                    print_map_line(&line_data);
+                }
+            },
+            None => {
+                let mut line_data: Vec<bool> = Vec::new();
+                line_data.resize(width_symbols as usize, false);
+                print_map_line(&line_data);
+            },
+        };
     }
+    //println!("{:?}",segment_map.get(&0).expect("Could not get segment 0"));
+
+    /* Pause and exit */
+    pause();
+    execute!(stdout(), terminal::LeaveAlternateScreen)?;
     Ok(())
 }
